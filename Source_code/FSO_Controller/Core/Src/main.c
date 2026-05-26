@@ -142,6 +142,8 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 // State variables
+
+bool pause = false;
 bool xMoving = false, yMoving = false, zMoving = false;
 bool motorsEnabled = true;
 uint16_t stepsRemainingX = 0;
@@ -151,21 +153,25 @@ uint16_t activeStepSize = 200;
 uint16_t steps_bef_resetY = 0;
 uint16_t steps_bef_resetZ = 0;
 uint16_t steps_bef_resetX = 0;
+bool isXPressed;
+bool isYPressed;
+bool isZPressed;
 
 
 char buf[128];
 
 uint8_t ddm_data[128]; // Buffer for DDM data
+uint16_t rx_raw;
 
 uint16_t output_pow_tm = 300;
 uint32_t timestamp;
 
 uint16_t rx_raw_max_dir = 0;
 uint16_t rx_raw_max = 0;
-bool first_round = false;
-bool second_round = false;
-bool finish_on_max = false;
-bool fresh_swept = false;
+bool end_on_max = false;
+bool histeresis_hit = false;
+bool first_sweep = false;
+bool second_sweep = false;
 
 bool axis_homed = false;
 // Latch variables
@@ -193,273 +199,225 @@ void Serial_Println(const char* str) {
     Serial_Print(str);
     Serial_Print("\r\n");
 }
-/* USER CODE END 0 */
 
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
-int main(void)
-{
+void Restart_States(void){
+	//OPTIMIZE RESTART
+	opt.optimize_state_machine = opt_idle;
+	opt.dir = 0;
+	rx_raw_max = 0;
+	rx_raw_max_dir = 0;
+	end_on_max = false;
+	histeresis_hit = false;
+	first_sweep = false;
+	second_sweep = false;
 
-  /* USER CODE BEGIN 1 */
+	//SPIRAL
+	spiral.state = IDLE;
+	spiral.amount = 0;
+	spiral.increment = 0;
 
-  /* USER CODE END 1 */
+	//MOVEMENT
 
-  /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
-  SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
-
-  /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_USART2_UART_Init();
-  MX_I2C1_Init();
-  /* USER CODE BEGIN 2 */
-  HAL_GPIO_WritePin(EN_Port, EN_Pin, GPIO_PIN_RESET);
-  Serial_Println("--- Dual Axis Limit Controller (Y & Z) ---");
-  spiral.amount = 0;
-  spiral.state = IDLE;
-  bool pause = false;
-  /* USER CODE END 2 */
-
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-	output_pow_tm = 300;
-	// 1. Check physical switch states (Assumes limits have Pull-Ups configured in CubeMX)
-	bool isXPressed = (HAL_GPIO_ReadPin(LIMIT_X_Port, LIMIT_X_Pin) == GPIO_PIN_RESET);
-	bool isYPressed = (HAL_GPIO_ReadPin(LIMIT_Y_Port, LIMIT_Y_Pin) == GPIO_PIN_RESET);
-	bool isZPressed = (HAL_GPIO_ReadPin(LIMIT_Z_Port, LIMIT_Z_Pin) == GPIO_PIN_RESET);
-	if(!pause){
+	steps_bef_resetY = 0;
+	steps_bef_resetX = 0;
+	steps_bef_resetZ = 0;
 
 
-		//Cool down the motors!
-		if(stepsRemainingX | stepsRemainingY | stepsRemainingZ)
-		  HAL_GPIO_WritePin(EN_Port, EN_Pin, GPIO_PIN_RESET);
-		else
-			HAL_GPIO_WritePin(EN_Port, EN_Pin, GPIO_PIN_SET);
+}
 
-		// 2. Handle X Latching Logic
-		if (isXPressed) {
-		  if (xMoving && blockedDirX == -1) {
-			sprintf(buf, "X:%d Y:%d Z:%d\r\n", steps_bef_resetX, steps_bef_resetY, steps_bef_resetZ);
-			Serial_Print(buf);
-			steps_bef_resetY = 0;
-			steps_bef_resetX = 0;
-			steps_bef_resetZ = 0;
-			blockedDirX = HAL_GPIO_ReadPin(DIRX_Port, DIRX_Pin);
-			xMoving = false;
-			stepsRemainingX = 0;
+void Handle_Movement(void){
 
 
-			//HOMING
-			if(homing_state_machine == to_e) { homing_state_machine = home_x; axis_homed = false; }
+	//Cool down the motors!
+	if(stepsRemainingX | stepsRemainingY | stepsRemainingZ)
+	  HAL_GPIO_WritePin(EN_Port, EN_Pin, GPIO_PIN_RESET);
+	else
+		HAL_GPIO_WritePin(EN_Port, EN_Pin, GPIO_PIN_SET);
 
-			Serial_Print("!! X LIMIT HIT !! Blocked: ");
-			Serial_Println(blockedDirX == GPIO_PIN_SET ? "HIGH (d)" : "LOW (a)");
-		  }
-		} else {
-		  blockedDirX = -1;
-		}
-		// 2. Handle Y Latching Logic
-		if (isYPressed) {
-		  if (yMoving && blockedDirY == -1) {
-			sprintf(buf, "X:%d Y:%d Z:%d\r\n", steps_bef_resetX, steps_bef_resetY, steps_bef_resetZ);
-			Serial_Print(buf);
-			steps_bef_resetY = 0;
-			steps_bef_resetX = 0;
-			steps_bef_resetZ = 0;
-			blockedDirY = HAL_GPIO_ReadPin(DIRY_Port, DIRY_Pin);
-			yMoving = false;
-			stepsRemainingY = 0;
-			//HOMING
-			if(homing_state_machine == to_d) { homing_state_machine = home_y; axis_homed = false; }
+	// 2. Handle X Latching Logic
+	if (isXPressed) {
+	  if (xMoving && blockedDirX == -1) {
+		sprintf(buf, "X:%d Y:%d Z:%d\r\n", steps_bef_resetX, steps_bef_resetY, steps_bef_resetZ);
+		Serial_Print(buf);
+		blockedDirX = HAL_GPIO_ReadPin(DIRX_Port, DIRX_Pin);
+		xMoving = false;
+		stepsRemainingX = 0;
+		//HOMING
+		if(homing_state_machine == to_e) { homing_state_machine = home_x; axis_homed = false; }
 
-			//SPIRAL
-			if(spiral.state != IDLE) { spiral.state = IDLE; }
+		Restart_States();
 
-			Serial_Print("!! Y LIMIT HIT !! Blocked: ");
-			Serial_Println(blockedDirY == GPIO_PIN_SET ? "HIGH (d)" : "LOW (a)");
-		  }
-		} else {
-		  blockedDirY = -1;
-		}
+		Serial_Print("!! X LIMIT HIT !! Blocked: ");
+		Serial_Println(blockedDirX == GPIO_PIN_SET ? "HIGH (d)" : "LOW (a)");
+	  }
+	} else {
+	  blockedDirX = -1;
+	}
+	// 2. Handle Y Latching Logic
+	if (isYPressed) {
+	  if (yMoving && blockedDirY == -1) {
+		sprintf(buf, "X:%d Y:%d Z:%d\r\n", steps_bef_resetX, steps_bef_resetY, steps_bef_resetZ);
+		Serial_Print(buf);
+		blockedDirY = HAL_GPIO_ReadPin(DIRY_Port, DIRY_Pin);
+		yMoving = false;
+		stepsRemainingY = 0;
+		//HOMING
+		if(homing_state_machine == to_d) { homing_state_machine = home_y; axis_homed = false; }
 
-		// 3. Handle Z Latching Logic
-		if (isZPressed) {
-		  if (zMoving && blockedDirZ == -1) {
-			sprintf(buf, "X:%d Y:%d Z:%d\r\n", steps_bef_resetX, steps_bef_resetY, steps_bef_resetZ);
-			Serial_Print(buf);
-			steps_bef_resetY = 0;
-			steps_bef_resetX = 0;
-			steps_bef_resetZ = 0;
-			blockedDirZ = HAL_GPIO_ReadPin(DIRZ_Port, DIRZ_Pin);
-			zMoving = false;
-			stepsRemainingZ = 0;
-			//HOMING
-			if(homing_state_machine == to_w) { homing_state_machine = home_z; axis_homed = false; }
+		Restart_States();
 
-			//SPIRAL
-			if(spiral.state != IDLE) spiral.state = IDLE;
+		Serial_Print("!! Y LIMIT HIT !! Blocked: ");
+		Serial_Println(blockedDirY == GPIO_PIN_SET ? "HIGH (d)" : "LOW (a)");
+	  }
+	} else {
+	  blockedDirY = -1;
+	}
 
-			Serial_Print("!! Z LIMIT HIT !! Blocked: ");
-			Serial_Println(blockedDirZ == GPIO_PIN_SET ? "HIGH (x)" : "LOW (w)");
-		  }
-		} else {
-		  blockedDirZ = -1;
-		}
+	// 3. Handle Z Latching Logic
+	if (isZPressed) {
+	  if (zMoving && blockedDirZ == -1) {
+		sprintf(buf, "X:%d Y:%d Z:%d\r\n", steps_bef_resetX, steps_bef_resetY, steps_bef_resetZ);
+		Serial_Print(buf);
+		blockedDirZ = HAL_GPIO_ReadPin(DIRZ_Port, DIRZ_Pin);
+		zMoving = false;
+		stepsRemainingZ = 0;
+		//HOMING
+		if(homing_state_machine == to_w) { homing_state_machine = home_z; axis_homed = false; }
 
-		// --- MOTOR PULSING ---
-		// X Safety Check
-		if (xMoving) {
-		  if (isXPressed && HAL_GPIO_ReadPin(DIRX_Port, DIRX_Pin) == blockedDirX) xMoving = false;
-		  else { HAL_GPIO_WritePin(STEPX_Port, STEPX_Pin, GPIO_PIN_SET); ++steps_bef_resetX; }
-		}
+		Restart_States();
 
-		// Y Safety Check
-		if (yMoving) {
-		  if (isYPressed && HAL_GPIO_ReadPin(DIRY_Port, DIRY_Pin) == blockedDirY) yMoving = false;
-		  else { HAL_GPIO_WritePin(STEPY_Port, STEPY_Pin, GPIO_PIN_SET); ++steps_bef_resetY; }
-		}
+		Serial_Print("!! Z LIMIT HIT !! Blocked: ");
+		Serial_Println(blockedDirZ == GPIO_PIN_SET ? "HIGH (x)" : "LOW (w)");
+	  }
+	} else {
+	  blockedDirZ = -1;
+	}
 
-		// Z Safety Check
-		if (zMoving) {
-		  if (isZPressed && HAL_GPIO_ReadPin(DIRZ_Port, DIRZ_Pin) == blockedDirZ) zMoving = false;
-		  else { HAL_GPIO_WritePin(STEPZ_Port, STEPZ_Pin, GPIO_PIN_SET);  ++steps_bef_resetZ; }
-		}
+	// --- MOTOR PULSING ---
+	// X Safety Check
+	if (xMoving) {
+	  if (isXPressed && HAL_GPIO_ReadPin(DIRX_Port, DIRX_Pin) == blockedDirX) xMoving = false;
+	  else { HAL_GPIO_WritePin(STEPX_Port, STEPX_Pin, GPIO_PIN_SET); ++steps_bef_resetX; }
+	}
 
-		// Delay 1ms (equivalent to delayMicroseconds(1000))
-		HAL_Delay(2);
+	// Y Safety Check
+	if (yMoving) {
+	  if (isYPressed && HAL_GPIO_ReadPin(DIRY_Port, DIRY_Pin) == blockedDirY) yMoving = false;
+	  else { HAL_GPIO_WritePin(STEPY_Port, STEPY_Pin, GPIO_PIN_SET); ++steps_bef_resetY; }
+	}
 
-		HAL_GPIO_WritePin(STEPX_Port, STEPX_Pin, GPIO_PIN_RESET);
-		HAL_GPIO_WritePin(STEPY_Port, STEPY_Pin, GPIO_PIN_RESET);
-		HAL_GPIO_WritePin(STEPZ_Port, STEPZ_Pin, GPIO_PIN_RESET);
+	// Z Safety Check
+	if (zMoving) {
+	  if (isZPressed && HAL_GPIO_ReadPin(DIRZ_Port, DIRZ_Pin) == blockedDirZ) zMoving = false;
+	  else { HAL_GPIO_WritePin(STEPZ_Port, STEPZ_Pin, GPIO_PIN_SET);  ++steps_bef_resetZ; }
+	}
 
-		if (stepsRemainingX > 0) {
-		  stepsRemainingX--;
-		} else {
-		  xMoving = false;
-		}
-		if (stepsRemainingY > 0) {
-		  stepsRemainingY--;
-		} else {
-		  yMoving = false;
-		}
-		if (stepsRemainingZ > 0) {
-		  stepsRemainingZ--;
-		} else {
-		  zMoving = false;
-		}
+	// Delay 1ms (equivalent to delayMicroseconds(1000))
+	HAL_Delay(2);
 
-		//spiral state machine
-		if(spiral.state != IDLE){
-			output_pow_tm = 50;
-			if(spiral.state == GO_D && !stepsRemainingY && !stepsRemainingZ){
-				HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, GPIO_PIN_SET);
-				yMoving = true;
-				stepsRemainingY = (++spiral.amount) * spiral.increment;
-				spiral.state = GO_W;
-			}
-			else if(spiral.state == GO_W && !stepsRemainingY && !stepsRemainingZ){
-				HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, GPIO_PIN_RESET);
-				zMoving = true;
-				stepsRemainingZ = spiral.amount * spiral.increment;
-				spiral.state = GO_A;
-			}
-			else if(spiral.state == GO_A && !stepsRemainingY && !stepsRemainingZ){
-				HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, GPIO_PIN_RESET);
-				yMoving = true;
-				stepsRemainingY = (++spiral.amount) * spiral.increment;
-				spiral.state = GO_X;
+	HAL_GPIO_WritePin(STEPX_Port, STEPX_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(STEPY_Port, STEPY_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(STEPZ_Port, STEPZ_Pin, GPIO_PIN_RESET);
 
-			}
-			else if(spiral.state == GO_X && !stepsRemainingY && !stepsRemainingZ){
-				HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, GPIO_PIN_SET);
-				zMoving = true;
-				stepsRemainingZ = spiral.amount * spiral.increment;
-				spiral.state = GO_D;
+	if (stepsRemainingX > 0) {
+	  stepsRemainingX--;
+	} else {
+	  xMoving = false;
+	}
+	if (stepsRemainingY > 0) {
+	  stepsRemainingY--;
+	} else {
+	  yMoving = false;
+	}
+	if (stepsRemainingZ > 0) {
+	  stepsRemainingZ--;
+	} else {
+	  zMoving = false;
+	}
+}
 
-			}
+void Spiral_State_Machine(void){
+	//spiral state machine
+	if(spiral.state == IDLE) return;
+	output_pow_tm = 50;
+	if(spiral.state == GO_D && !stepsRemainingY && !stepsRemainingZ){
+		HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, GPIO_PIN_SET);
+		yMoving = true;
+		stepsRemainingY = (++spiral.amount) * spiral.increment;
+		spiral.state = GO_W;
+	}
+	else if(spiral.state == GO_W && !stepsRemainingY && !stepsRemainingZ){
+		HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, GPIO_PIN_RESET);
+		zMoving = true;
+		stepsRemainingZ = spiral.amount * spiral.increment;
+		spiral.state = GO_A;
+	}
+	else if(spiral.state == GO_A && !stepsRemainingY && !stepsRemainingZ){
+		HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, GPIO_PIN_RESET);
+		yMoving = true;
+		stepsRemainingY = (++spiral.amount) * spiral.increment;
+		spiral.state = GO_X;
 
-		}
-
-		//state machine for homing
-		if(homing_state_machine != idle && !stepsRemainingX && !stepsRemainingY && !stepsRemainingZ){
-			switch(homing_state_machine){
-			case to_e:
-				HAL_GPIO_WritePin(DIRX_Port, DIRX_Pin, GPIO_PIN_SET); xMoving = true; stepsRemainingX = 60000;
-				break;
-
-			case home_x:
-				if(!axis_homed) { HAL_GPIO_WritePin(DIRX_Port, DIRX_Pin, GPIO_PIN_RESET); xMoving = true; stepsRemainingX = E_T_R; axis_homed = true; }
-				else homing_state_machine = idle;
-				break;
-
-			case to_d:
-				HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, GPIO_PIN_SET); yMoving = true; stepsRemainingY = 15000;
-				break;
-
-			case home_y:
-				if(!axis_homed) { HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, GPIO_PIN_RESET); yMoving = true; stepsRemainingY = D_T_A; axis_homed = true; }
-				else homing_state_machine = to_w;
-				break;
-
-			case to_w:
-				HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, GPIO_PIN_RESET); zMoving = true; stepsRemainingZ = 15000;
-				break;
-
-			case home_z:
-				if(!axis_homed) { HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, GPIO_PIN_SET); zMoving = true; stepsRemainingZ = W_T_X; axis_homed = true; }
-				else homing_state_machine = idle;
-				break;
-			default: break;
-
-
-			}
-		}
+	}
+	else if(spiral.state == GO_X && !stepsRemainingY && !stepsRemainingZ){
+		HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, GPIO_PIN_SET);
+		zMoving = true;
+		stepsRemainingZ = spiral.amount * spiral.increment;
+		spiral.state = GO_D;
 
 	}
 
 
+}
+
+void Homing_State_Machine(void){
+	//state machine for homing
+	if(!(homing_state_machine != idle && !stepsRemainingX && !stepsRemainingY && !stepsRemainingZ)) return;
+	switch(homing_state_machine){
+	case to_e:
+		HAL_GPIO_WritePin(DIRX_Port, DIRX_Pin, GPIO_PIN_SET); xMoving = true; stepsRemainingX = 60000;
+		break;
+
+	case home_x:
+		if(!axis_homed) { HAL_GPIO_WritePin(DIRX_Port, DIRX_Pin, GPIO_PIN_RESET); xMoving = true; stepsRemainingX = E_T_R; axis_homed = true; }
+		else homing_state_machine = idle;
+		break;
+
+	case to_d:
+		HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, GPIO_PIN_SET); yMoving = true; stepsRemainingY = 15000;
+		break;
+
+	case home_y:
+		if(!axis_homed) { HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, GPIO_PIN_RESET); yMoving = true; stepsRemainingY = D_T_A; axis_homed = true; }
+		else homing_state_machine = to_w;
+		break;
+
+	case to_w:
+		HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, GPIO_PIN_RESET); zMoving = true; stepsRemainingZ = 15000;
+		break;
+
+	case home_z:
+		if(!axis_homed) { HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, GPIO_PIN_SET); zMoving = true; stepsRemainingZ = W_T_X; axis_homed = true; }
+		else homing_state_machine = idle;
+		break;
+	default: break;
+
+
+	}
+
+}
+
+void Serial_Comms(void){
 	uint8_t c;
 	// --- SERIAL COMMS ---
 	// Non-blocking UART receive (timeout = 0)
-	if (HAL_UART_Receive(&huart2, &c, 1, 0) == HAL_OK) {
+	if (HAL_UART_Receive(&huart2, &c, 1, 0) != HAL_OK) return;
 
-	  switch (c) {
-
-		case 'G':
+	switch (c) {
+		case 'g':
+		  Restart_States();
 		  opt.optimize_state_machine = opt_z;
 		  opt.step_size = 10;
-		  opt.dir = 0;
-			rx_raw_max = 0;
-			rx_raw_max_dir = 0;
-			first_round = false;
-			second_round = false;
-			finish_on_max = false;
-		  break;
-		case 'g':
-		  opt.optimize_state_machine = opt_z;
-		  opt.step_size = 1;
-		  opt.dir = 0;
-			rx_raw_max = 0;
-			rx_raw_max_dir = 0;
-			first_round = false;
-			finish_on_max = false;
-			fresh_swept = false;
 		  break;
 
 		case 'h':
@@ -469,14 +427,15 @@ int main(void)
 		  homing_state_machine = to_e;
 		  break;
 		case 'j':
+
+		  Restart_States();
 		  spiral.state = GO_D;
-		  spiral.amount = 0;
 		  spiral.increment = SPIRAL_INCREMENT;
 		  break;
 
 		case 'J':
+		  Restart_States();
 		  spiral.state = GO_D;
-		  spiral.amount = 0;
 		  spiral.increment = SPIRAL_INCREMENT_BROAD;
 		  break;
 		case 'p':
@@ -527,35 +486,37 @@ int main(void)
 		  Serial_Print(buf);
 		  break;
 		case ' ': xMoving = yMoving = zMoving = false; stepsRemainingX = 0; stepsRemainingY = 0; stepsRemainingZ = 0;
-		 spiral.state = IDLE; homing_state_machine = idle;
+		 spiral.state = IDLE;
+		 homing_state_machine = idle;
 		 opt.optimize_state_machine = opt_idle;
 
 
 		snprintf(buf, sizeof(buf), "steps_bef_resetY: %u, steps_bef_resetZ: %u, steps_bef_resetX: %u\r\n", steps_bef_resetY, steps_bef_resetZ, steps_bef_resetX);
 		  Serial_Print(buf);
 		break;
-	  }
 	}
+}
 
+
+
+void I2C_Readout(void){
 	//READOUT
-	if(HAL_GetTick() - timestamp > output_pow_tm || (opt.optimize_state_machine != opt_idle && !stepsRemainingX && !stepsRemainingY && !stepsRemainingZ)){
 
-		if (HAL_I2C_Mem_Read(&hi2c1, SFP_ADDR_DDM, 96, I2C_MEMADD_SIZE_8BIT, &ddm_data[96], 22,100) == HAL_OK)
-		  {
-		    char buf[32];
-			// --- RX POWER
-			// Offset 104-105. Units are 0.1 uW
-			uint16_t rx_raw = ((ddm_data[104] << 8) | ddm_data[105]) - 1;
+	if (HAL_I2C_Mem_Read(&hi2c1, SFP_ADDR_DDM, 96, I2C_MEMADD_SIZE_8BIT, &ddm_data[96], 22,100) != HAL_OK) return;
+	char buf[32];
+	// --- RX POWER
+	// Offset 104-105. Units are 0.1 uW
+	rx_raw = ((ddm_data[104] << 8) | ddm_data[105]) - 1;
 
-			// Integer division gives the whole number, modulo gives the remainder
-			uint16_t whole_uw = rx_raw / 10;
-			uint16_t decimal_uw = rx_raw % 10;
+	// Integer division gives the whole number, modulo gives the remainder
+	uint16_t whole_uw = rx_raw / 10;
+	uint16_t decimal_uw = rx_raw % 10;
 
-			if(spiral.state != IDLE && rx_raw > 0 && rx_raw < 100) {spiral.state = IDLE; }
+	if(spiral.state != IDLE && rx_raw > 0 && rx_raw < 100) {spiral.state = IDLE; }
 
-			// Outputs: "Power: 123.4 uW"
-			snprintf(buf, sizeof(buf), "Power: %u.%u uW\r\n", whole_uw, decimal_uw);
-			Serial_Print(buf);
+	// Outputs: "Power: 123.4 uW"
+	snprintf(buf, sizeof(buf), "Power: %u.%u uW\r\n", whole_uw, decimal_uw);
+	Serial_Print(buf);
 
 //
 //			float rx_uw = rx_raw * 0.0001f;
@@ -568,43 +529,117 @@ int main(void)
 //			if(spiral.state != IDLE && rx_power_dbm > -39.99f && rx_power_dbm < -30.00f) {spiral.state = IDLE; }
 //			snprintf(buf, sizeof(buf), "Power: %f dbm\r\n", rx_power_dbm);
 //			Serial_Print(buf);
-			timestamp = HAL_GetTick();
+	timestamp = HAL_GetTick();
 
-			if(opt.optimize_state_machine != opt_idle){
-				if(finish_on_max && rx_raw_max <= rx_raw){
-					switch(opt.optimize_state_machine){
-					case opt_z: opt.optimize_state_machine = opt_y; break;
-					case opt_y: opt.optimize_state_machine = opt_idle; break;
-					default: break;
-					}
-					rx_raw_max = 0;
-					rx_raw_max_dir = 0;
-					first_round = false;
-					second_round = false;
-					finish_on_max = false;
-					continue; // GO TO NEXT WHILE(1)
-				}
-				if(rx_raw_max < rx_raw) {rx_raw_max = rx_raw; rx_raw_max_dir = opt.dir; fresh_swept = true;}
-				else if(rx_raw == 0 && fresh_swept){
-					opt.dir = !opt.dir;
-					fresh_swept = false;
-					if(!first_round) first_round = true;
-					else if(first_round && !second_round) second_round = true;
-					else finish_on_max = true;
-				}
-				else if(rx_raw > 10) fresh_swept = true;
-
-				switch(opt.optimize_state_machine){
-					case opt_z: HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, opt.dir); zMoving = true; stepsRemainingZ = opt.step_size; break;
-					case opt_y: HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, opt.dir); yMoving = true; stepsRemainingY = opt.step_size; break;
-					default: break;
-				}
-				HAL_Delay(50);
+}
+void Optimize(void){
+	if(opt.optimize_state_machine == opt_idle) return;
+	if(rx_raw >= rx_raw_max){
+		rx_raw_max = rx_raw;
+		rx_raw_max_dir = opt.dir;
+		if(end_on_max){
+			stepsRemainingZ = 0; stepsRemainingY = 0;
+			switch(opt.optimize_state_machine){
+				case opt_z: opt.optimize_state_machine = opt_y; break;
+				case opt_y: opt.optimize_state_machine = opt_idle; break;
+				default: break;
 			}
-
-		  }
-
+			rx_raw_max = 0;
+			rx_raw_max_dir = 0;
+			end_on_max = false;
+			histeresis_hit = false;
+			first_sweep = false;
+			second_sweep = false;
+			end_on_max = false;
+			opt.step_size = 10;
+			return;
+		}
 	}
+
+	if((rx_raw < rx_raw_max / 4 || rx_raw == 0) && histeresis_hit){
+		opt.dir = !opt.dir;
+		if(end_on_max && opt.step_size != 1) {if((opt.step_size -= 2) < 1) opt.step_size = 1;}
+		else if(end_on_max) rx_raw_max -= 10;
+		end_on_max = second_sweep;
+		second_sweep = first_sweep;
+		first_sweep = true;
+		histeresis_hit = false;
+	}
+	//WHen we skip histeresis point and go below it down to 0 is catastrophic, things just broke up :/
+	else if(rx_raw > rx_raw_max / 2) histeresis_hit = true;
+
+	switch(opt.optimize_state_machine){
+		case opt_z: HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, opt.dir); zMoving = true; stepsRemainingZ = opt.step_size;  break;
+		case opt_y: HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, opt.dir); yMoving = true; stepsRemainingY = opt.step_size; break;
+		default: break;
+	}
+	HAL_Delay(25);
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();
+  MX_I2C1_Init();
+  /* USER CODE BEGIN 2 */
+  HAL_GPIO_WritePin(EN_Port, EN_Pin, GPIO_PIN_RESET);
+  Serial_Println("--- Dual Axis Limit Controller (Y & Z) ---");
+  Restart_States();
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+	output_pow_tm = 300;
+	// 1. Check physical switch states (Assumes limits have Pull-Ups configured in CubeMX)
+	isXPressed = (HAL_GPIO_ReadPin(LIMIT_X_Port, LIMIT_X_Pin) == GPIO_PIN_RESET);
+	isYPressed = (HAL_GPIO_ReadPin(LIMIT_Y_Port, LIMIT_Y_Pin) == GPIO_PIN_RESET);
+	isZPressed = (HAL_GPIO_ReadPin(LIMIT_Z_Port, LIMIT_Z_Pin) == GPIO_PIN_RESET);
+
+	if(!pause){
+		Handle_Movement();
+		Spiral_State_Machine();
+		Homing_State_Machine();
+	}
+
+	Serial_Comms();
+
+	if(HAL_GetTick() - timestamp > output_pow_tm || (opt.optimize_state_machine != opt_idle && !stepsRemainingX && !stepsRemainingY && !stepsRemainingZ)){
+		I2C_Readout();
+		Optimize();
+	}
+
+
+
 
 
     /* USER CODE END WHILE */
