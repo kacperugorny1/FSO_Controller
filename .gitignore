@@ -1,5 +1,8 @@
 #settings
 .settings/
+.devcontainer/
+.vscode/
+
 
 #metadata
 .metadata/
