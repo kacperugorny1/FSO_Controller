@@ -62,7 +62,7 @@
 #define SFP_ADDR_INFO  (0x50 << 1) // 0xA0
 #define SFP_ADDR_DDM   (0x51 << 1) // 0xA2
 
-#define BLACK 1
+#define BLACK 0
 #if BLACK == 1 //BLACK
 #define A_T_D 5748
 #define D_T_A (3164 - 300)
