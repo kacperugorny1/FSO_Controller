@@ -103,6 +103,20 @@ static void device_uart_to_pc_task(void *pvParameters) {
                 if (len > 0) {
                     uart_write_bytes(UART_PC, (const char *)dtmp, len);
                 }
+                if (strncmp((char *)dtmp, "AC_INIT", 7) == 0) {
+                    //Transfer to slave to initialize the AC unit
+                    esp_err_t err = esp_now_send(slave_mac, (const uint8_t *)"AC_INIT\r\n", strlen("AC_INIT\r\n"));
+                    if (err != ESP_OK) {
+                        ESP_LOGW(TAG, "Failed to send AC_INIT to Slave: %s", esp_err_to_name(err));
+                    }
+                }
+                else if (strncmp((char *)dtmp, "AC_DONE", 7) == 0) {
+                    //Transfer to slave to indicate AC unit is done
+                    esp_err_t err = esp_now_send(slave_mac, (const uint8_t *)"AC_DONE\r\n", strlen("AC_DONE\r\n"));
+                    if (err != ESP_OK) {
+                        ESP_LOGW(TAG, "Failed to send AC_DONE to Slave: %s", esp_err_to_name(err));
+                    }
+                }
             }
             else if (event.type == UART_FIFO_OVF || event.type == UART_BUFFER_FULL) {
                 uart_flush_input(UART_DEVICE);
@@ -127,6 +141,13 @@ static void espnow_to_pc_task(void *pvParameters) {
             // Combine prefix and data so it prints seamlessly on the PC
             memcpy(&out_buf[2], packet.data, packet.len);
             uart_write_bytes(UART_PC, (const char *)out_buf, packet.len + 2);
+            if (strncmp((char *)packet.data, "AC_INIT", 7) == 0) {
+                // If the Slave sends an AC status update, also forward it to the Local Device
+                uart_write_bytes(UART_DEVICE, "\'", 1); // Send translated AC_INIT TO 1 byte message device understands
+            }
+            else if (strncmp((char *)packet.data, "AC_DONE", 7) == 0) {
+                uart_write_bytes(UART_DEVICE, "\"", 1); // Send translated AC_DONE TO 1 byte message device understands
+            }
         }
     }
 }

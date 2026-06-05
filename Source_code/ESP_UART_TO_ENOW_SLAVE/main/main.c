@@ -62,8 +62,16 @@ static void espnow_to_uart_task(void *pvParameters) {
         // Wait for data to arrive from the RF callback
         if (xQueueReceive(espnow_rx_queue, &packet, portMAX_DELAY)) {
             // Write to UART safely outside the Wi-Fi task
-            uart_write_bytes(UART_NUM, (const char *)packet.data, packet.len);
-            
+            if (strncmp((char *)packet.data, "AC_INIT", 7) == 0) {
+                // If the Slave sends an AC status update, also forward it to the Local Device
+                uart_write_bytes(UART_NUM, "\'", 1); // Send translated AC_INIT TO 1 byte message device understands
+            }
+            else if (strncmp((char *)packet.data, "AC_DONE", 7) == 0) {
+                uart_write_bytes(UART_NUM, "\"", 1); // Send translated AC_DONE TO 1 byte message device understands
+            }
+            else {
+                uart_write_bytes(UART_NUM, (const char *)packet.data, packet.len);
+            }
         }
     }
 }
