@@ -62,7 +62,7 @@
 #define SFP_ADDR_INFO  (0x50 << 1) // 0xA0
 #define SFP_ADDR_DDM   (0x51 << 1) // 0xA2
 
-#define BLACK 0
+#define BLACK 1
 #if BLACK == 1 //BLACK
 #define A_T_D 5748
 #define D_T_A (3164 - 300)
@@ -87,14 +87,32 @@
 #define SPIRAL_INCREMENT 25
 #define SPIRAL_INCREMENT_BROAD 200
 
+
+// =========================================================
+// Active Compensation Configuration
+// =========================================================
+
+// Timing & Iterations
+#define AC_TIMEOUT_MS          1000   // Comm timeout and IDLE reset interval (ms)
+#define AC_RUN_ITERATIONS      10     // Number of step iterations per compensation run
+#define AC_TICKS_PER_STEP      3      // Super loop cycles to wait between motor evaluations
+
+// Math & Thresholds
+#define AC_THRESH_NUM          4      // Threshold multiplier
+#define AC_THRESH_DEN          5      // Threshold divisor-> 4/5 = 80%
+#define AC_EMA_PERIOD          7      // Moving average period/weighting factor, ~ 13 samples SMA
+
+
+#define ADC_REFRESH_TIME    15     // Default output power time interval
+
 typedef enum{
-	to_e,
-	home_x,
-	to_d,
-	home_y,
-	to_w,
-	home_z,
-	idle
+	TO_E,
+	HOME_X,
+	TO_D,
+	HOME_Y,
+	TO_W,
+	HOME_Z,
+	HO_IDLE
 } homing_states;
 
 typedef enum{
@@ -106,20 +124,43 @@ typedef enum{
 } spiral_dir;
 
 typedef enum{
-	opt_idle,
-	opt_z,
-	opt_y,
-	opt_x
+	OPT_IDLE,
+	OPT_Z,
+	OPT_Y,
+	OPT_X
 } opt_states;
 
-struct{
+//AC - active compensation
+typedef enum{
+	AC_OFF, // NO ac at all
+	AC_IDLE, // ac turn on, monitor power and see what happens, if power drops below treshold, change to ac_rdy_to_run and send to esp to signal
+	AC_RUN, // run ac algorithm
+	AC_WAIT_TO_SAVE, //ac wait for another device to save the pavg
+	AC_PAVG_MEAS //measure pavg
+} ac_states;
+
+struct ac_struct{
+	ac_states state;
+	uint8_t steps;
+	uint8_t pavg_num;
+	uint8_t SMA_num;
+	uint8_t EMA_num;
+	int mov_avg;
+	int pmax;
+	uint8_t iter;
+	bool dir;
+	bool dirz, diry;
+	bool me_init;
+} ac;
+
+struct spiral_struct{
 	spiral_dir state;
 	int amount;
 	int increment;
 } spiral;
 
 
-struct{
+struct opt_struct{
 	opt_states optimize_state_machine;
 	int dir;
 	int step_size;
@@ -127,7 +168,7 @@ struct{
 
 
 
-homing_states homing_state_machine = idle;
+homing_states homing_state_machine = HO_IDLE;
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -202,7 +243,7 @@ void Serial_Println(const char* str) {
 
 void Restart_States(void){
 	//OPTIMIZE RESTART
-	opt.optimize_state_machine = opt_idle;
+	opt.optimize_state_machine = OPT_IDLE;
 	opt.dir = 0;
 	rx_raw_max = 0;
 	rx_raw_max_dir = 0;
@@ -216,18 +257,35 @@ void Restart_States(void){
 	spiral.amount = 0;
 	spiral.increment = 0;
 
+	homing_state_machine = HO_IDLE;
+
+
 	//MOVEMENT
+
+	stepsRemainingX = 0;
+	stepsRemainingY = 0;
+	stepsRemainingZ = 0;
 
 	steps_bef_resetY = 0;
 	steps_bef_resetX = 0;
 	steps_bef_resetZ = 0;
 
+	//AC RESTART
+	ac.state = AC_OFF;
+	ac.mov_avg = 0;
+	ac.pmax = 0;
+
+	output_pow_tm = 300;
 
 }
 
 void Handle_Movement(void){
 
 
+	// 1. Check physical switch states (Assumes limits have Pull-Ups configured in CubeMX)
+	isXPressed = (HAL_GPIO_ReadPin(LIMIT_X_Port, LIMIT_X_Pin) == GPIO_PIN_RESET);
+	isYPressed = (HAL_GPIO_ReadPin(LIMIT_Y_Port, LIMIT_Y_Pin) == GPIO_PIN_RESET);
+	isZPressed = (HAL_GPIO_ReadPin(LIMIT_Z_Port, LIMIT_Z_Pin) == GPIO_PIN_RESET);
 	//Cool down the motors!
 	if(stepsRemainingX | stepsRemainingY | stepsRemainingZ)
 	  HAL_GPIO_WritePin(EN_Port, EN_Pin, GPIO_PIN_RESET);
@@ -243,9 +301,8 @@ void Handle_Movement(void){
 		xMoving = false;
 		stepsRemainingX = 0;
 		//HOMING
-		if(homing_state_machine == to_e) { homing_state_machine = home_x; axis_homed = false; }
-
-		Restart_States();
+		if(homing_state_machine == TO_E) { homing_state_machine = HOME_X; axis_homed = false; }
+		else Restart_States();
 
 		Serial_Print("!! X LIMIT HIT !! Blocked: ");
 		Serial_Println(blockedDirX == GPIO_PIN_SET ? "HIGH (d)" : "LOW (a)");
@@ -262,9 +319,8 @@ void Handle_Movement(void){
 		yMoving = false;
 		stepsRemainingY = 0;
 		//HOMING
-		if(homing_state_machine == to_d) { homing_state_machine = home_y; axis_homed = false; }
-
-		Restart_States();
+		if(homing_state_machine == TO_D) { homing_state_machine = HOME_Y; axis_homed = false; }
+		else Restart_States();
 
 		Serial_Print("!! Y LIMIT HIT !! Blocked: ");
 		Serial_Println(blockedDirY == GPIO_PIN_SET ? "HIGH (d)" : "LOW (a)");
@@ -282,9 +338,8 @@ void Handle_Movement(void){
 		zMoving = false;
 		stepsRemainingZ = 0;
 		//HOMING
-		if(homing_state_machine == to_w) { homing_state_machine = home_z; axis_homed = false; }
-
-		Restart_States();
+		if(homing_state_machine == TO_W) { homing_state_machine = HOME_Z; axis_homed = false; }
+		else Restart_States();
 
 		Serial_Print("!! Z LIMIT HIT !! Blocked: ");
 		Serial_Println(blockedDirZ == GPIO_PIN_SET ? "HIGH (x)" : "LOW (w)");
@@ -339,7 +394,6 @@ void Handle_Movement(void){
 void Spiral_State_Machine(void){
 	//spiral state machine
 	if(spiral.state == IDLE) return;
-	output_pow_tm = 50;
 	if(spiral.state == GO_D && !stepsRemainingY && !stepsRemainingZ){
 		HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, GPIO_PIN_SET);
 		yMoving = true;
@@ -372,33 +426,33 @@ void Spiral_State_Machine(void){
 
 void Homing_State_Machine(void){
 	//state machine for homing
-	if(!(homing_state_machine != idle && !stepsRemainingX && !stepsRemainingY && !stepsRemainingZ)) return;
+	if(!(homing_state_machine != HO_IDLE && !stepsRemainingX && !stepsRemainingY && !stepsRemainingZ)) return;
 	switch(homing_state_machine){
-	case to_e:
+	case TO_E:
 		HAL_GPIO_WritePin(DIRX_Port, DIRX_Pin, GPIO_PIN_SET); xMoving = true; stepsRemainingX = 60000;
 		break;
 
-	case home_x:
+	case HOME_X:
 		if(!axis_homed) { HAL_GPIO_WritePin(DIRX_Port, DIRX_Pin, GPIO_PIN_RESET); xMoving = true; stepsRemainingX = E_T_R; axis_homed = true; }
-		else homing_state_machine = idle;
+		else homing_state_machine = HO_IDLE;
 		break;
 
-	case to_d:
+	case TO_D:
 		HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, GPIO_PIN_SET); yMoving = true; stepsRemainingY = 15000;
 		break;
 
-	case home_y:
+	case HOME_Y:
 		if(!axis_homed) { HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, GPIO_PIN_RESET); yMoving = true; stepsRemainingY = D_T_A; axis_homed = true; }
-		else homing_state_machine = to_w;
+		else homing_state_machine = TO_W;
 		break;
 
-	case to_w:
+	case TO_W:
 		HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, GPIO_PIN_RESET); zMoving = true; stepsRemainingZ = 15000;
 		break;
 
-	case home_z:
+	case HOME_Z:
 		if(!axis_homed) { HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, GPIO_PIN_SET); zMoving = true; stepsRemainingZ = W_T_X; axis_homed = true; }
-		else homing_state_machine = idle;
+		else homing_state_machine = HO_IDLE;
 		break;
 	default: break;
 
@@ -416,25 +470,67 @@ void Serial_Comms(void){
 	switch (c) {
 		case 'g':
 		  Restart_States();
-		  opt.optimize_state_machine = opt_z;
+		  opt.optimize_state_machine = OPT_Z;
 		  opt.step_size = 10;
+		  output_pow_tm = ADC_REFRESH_TIME;
+		  break;
+
+		case 'c':
+		  if(ac.state == AC_OFF){
+			  Restart_States();
+			  ac.state = AC_PAVG_MEAS;
+			  ac.SMA_num = ac.pavg_num;
+			  output_pow_tm = ADC_REFRESH_TIME;
+			  Serial_Println("Active compensation ON!");
+		  }
+		  else {
+			  Restart_States();
+			  ac.state = AC_OFF;
+			  Serial_Println("Active compensation OFF!");
+		  }
+		  break;
+		case '\'':
+			if(ac.state == AC_IDLE) {
+			  Serial_Println("Receive AC_INIT");
+			  ac.me_init = false;
+			  ac.state = AC_RUN;
+			  ac.iter = AC_RUN_ITERATIONS;
+			  ac.EMA_num = 0;
+			}
+
+		  break;
+		case '"':
+		  if(ac.state == AC_IDLE){
+			  ac.state = AC_RUN;
+			  ac.iter = AC_RUN_ITERATIONS;
+			  ac.EMA_num = 0;
+			  Serial_Println("Receive AC_DONE, START RUN");
+		  }
+		  else if(ac.state == AC_WAIT_TO_SAVE){
+			  ac.state = AC_PAVG_MEAS;
+			  ac.SMA_num = ac.pavg_num;
+			  ac.mov_avg = 0;
+			  Serial_Println("Receive AC_DONE, PROCESS AVG");
+		  }
 		  break;
 
 		case 'h':
-		  homing_state_machine = to_d;
+		  homing_state_machine = TO_D;
 		  break;
 		case 'k':
-		  homing_state_machine = to_e;
+		  homing_state_machine = TO_E;
 		  break;
 		case 'j':
 
 		  Restart_States();
+		  output_pow_tm = ADC_REFRESH_TIME;
 		  spiral.state = GO_D;
 		  spiral.increment = SPIRAL_INCREMENT;
 		  break;
 
 		case 'J':
 		  Restart_States();
+		  output_pow_tm = ADC_REFRESH_TIME;
 		  spiral.state = GO_D;
 		  spiral.increment = SPIRAL_INCREMENT_BROAD;
 		  break;
@@ -485,15 +581,11 @@ void Serial_Comms(void){
 		  snprintf(buf, sizeof(buf), "Step size: %u\r\n", activeStepSize);
 		  Serial_Print(buf);
 		  break;
-		case ' ': xMoving = yMoving = zMoving = false; stepsRemainingX = 0; stepsRemainingY = 0; stepsRemainingZ = 0;
-		 spiral.state = IDLE;
-		 homing_state_machine = idle;
-		 opt.optimize_state_machine = opt_idle;
-
-
-		snprintf(buf, sizeof(buf), "steps_bef_resetY: %u, steps_bef_resetZ: %u, steps_bef_resetX: %u\r\n", steps_bef_resetY, steps_bef_resetZ, steps_bef_resetX);
-		  Serial_Print(buf);
-		break;
+		case ' ':
+		 snprintf(buf, sizeof(buf), "steps_bef_resetY: %u, steps_bef_resetZ: %u, steps_bef_resetX: %u\r\n", steps_bef_resetY, steps_bef_resetZ, steps_bef_resetX);
+		 Serial_Print(buf);
+		 Restart_States();
+		 break;
 	}
 }
 
@@ -512,13 +604,15 @@ void I2C_Readout(void){
 	uint16_t whole_uw = rx_raw / 10;
 	uint16_t decimal_uw = rx_raw % 10;
 
-	if(spiral.state != IDLE && rx_raw > 0 && rx_raw < 100) {spiral.state = IDLE; }
+	if(spiral.state != IDLE && rx_raw > 0 && rx_raw < 100) {Restart_States();}
 
+	timestamp = HAL_GetTick();
 	// Outputs: "Power: 123.4 uW"
-	snprintf(buf, sizeof(buf), "Power: %u.%u uW\r\n", whole_uw, decimal_uw);
-	Serial_Print(buf);
+	if(ac.state == AC_OFF){
+		snprintf(buf, sizeof(buf), "T:%lu, Power: %u.%u uW\r\n",timestamp , whole_uw, decimal_uw);
+		Serial_Print(buf);
+	}
 
-//
 //			float rx_uw = rx_raw * 0.0001f;
 //
 //			if(rx_uw > 0) {
@@ -529,19 +623,18 @@ void I2C_Readout(void){
 //			if(spiral.state != IDLE && rx_power_dbm > -39.99f && rx_power_dbm < -30.00f) {spiral.state = IDLE; }
 //			snprintf(buf, sizeof(buf), "Power: %f dbm\r\n", rx_power_dbm);
 //			Serial_Print(buf);
-	timestamp = HAL_GetTick();
 
 }
 void Optimize(void){
-	if(opt.optimize_state_machine == opt_idle) return;
+	if(opt.optimize_state_machine == OPT_IDLE) return;
 	if(rx_raw >= rx_raw_max){
 		rx_raw_max = rx_raw;
 		rx_raw_max_dir = opt.dir;
 		if(end_on_max){
 			stepsRemainingZ = 0; stepsRemainingY = 0;
 			switch(opt.optimize_state_machine){
-				case opt_z: opt.optimize_state_machine = opt_y; break;
-				case opt_y: opt.optimize_state_machine = opt_idle; break;
+				case OPT_Z: opt.optimize_state_machine = OPT_Y; break;
+				case OPT_Y: opt.optimize_state_machine = OPT_IDLE; output_pow_tm = 300; break;
 				default: break;
 			}
 			rx_raw_max = 0;
@@ -569,11 +662,97 @@ void Optimize(void){
 	else if(rx_raw > rx_raw_max / 2) histeresis_hit = true;
 
 	switch(opt.optimize_state_machine){
-		case opt_z: HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, opt.dir); zMoving = true; stepsRemainingZ = opt.step_size;  break;
-		case opt_y: HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, opt.dir); yMoving = true; stepsRemainingY = opt.step_size; break;
+		case OPT_Z: HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, opt.dir); zMoving = true; stepsRemainingZ = opt.step_size;  break;
+		case OPT_Y: HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, opt.dir); yMoving = true; stepsRemainingY = opt.step_size; break;
 		default: break;
 	}
-	HAL_Delay(25);
+}
+
+void Active_Compensation(void){
+
+	char buf[32];
+	if(ac.state == AC_OFF) return;
+	static uint32_t ac_timestamp;
+	static uint32_t old_mov_avg;
+
+	// whole procedure must be pretty quick, to make it work real time
+	switch(ac.state){
+	case AC_IDLE:
+		//Measure Pavg, needs to ignore 0's or very low as it is some accidential collision
+		//If Pavg < tresh*Pmax then communicate a will of compensation
+		if(rx_raw == 0xFFFF) break; // eliminate big error
+		if(rx_raw == 0x0000) break; // eliminate big error
+		ac.mov_avg = rx_raw / AC_EMA_PERIOD + ac.mov_avg * (AC_EMA_PERIOD - 1) / AC_EMA_PERIOD;
+		if(HAL_GetTick() - ac_timestamp > AC_TIMEOUT_MS && ac.mov_avg <= ac.pmax * AC_THRESH_NUM / AC_THRESH_DEN){
+			Serial_Println("AC_INIT");
+			snprintf(buf, sizeof(buf), "Pavg = %u.%u uW \r\n", ac.mov_avg / 10, ac.mov_avg % 10);
+			Serial_Print(buf);
+
+			ac_timestamp = HAL_GetTick();
+			ac.me_init = true;
+		}
+
+		break;
+	case AC_RUN:
+		//Receive signal from Serialcomms, AC_INIT/AC_DONE FROM AC_IDLE
+		if(ac.EMA_num == 0){
+			if(ac.dir){
+				if(old_mov_avg > ac.mov_avg) ac.dirz = !ac.dirz;
+				HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, ac.dirz); zMoving = true; stepsRemainingZ = ac.steps;
+			}
+			else{
+				--ac.iter;
+				if(old_mov_avg > ac.mov_avg) ac.diry = !ac.diry;
+				HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, ac.diry); yMoving = true; stepsRemainingY = ac.steps;
+			}
+			ac.dir = !ac.dir;
+			old_mov_avg = ac.mov_avg;
+		}
+		ac.mov_avg = ac.mov_avg / 2 + rx_raw / 2;
+		ac.EMA_num = (ac.EMA_num + 1) % AC_TICKS_PER_STEP;
+		if(!ac.iter){
+			ac.state = AC_WAIT_TO_SAVE;
+			ac_timestamp = HAL_GetTick();
+			Serial_Println("AC_DONE");
+		}
+
+		break;
+
+	case AC_WAIT_TO_SAVE:
+		//wait for 2nd to finish and save, AC_DONE INDICATES
+		if(ac.me_init) { // if i begin i measure
+			ac.state = AC_PAVG_MEAS;
+			ac.SMA_num = ac.pavg_num;
+			ac.mov_avg = 0;
+		}
+		if(HAL_GetTick() - ac_timestamp > AC_TIMEOUT_MS)
+		{
+			Serial_Println("NO COMMS, State = PAVG_MEAS");
+			ac.state = AC_PAVG_MEAS;
+			ac.SMA_num = ac.pavg_num;
+			ac.mov_avg = 0;
+		}
+		break;
+
+	case AC_PAVG_MEAS:
+		//measure, save as max and go idle
+		if(rx_raw == 0xFFFF) break;
+		ac.mov_avg += rx_raw;
+		if(!(--ac.SMA_num))
+		{
+
+			ac.pmax = ac.mov_avg / ac.pavg_num;
+			ac.mov_avg = ac.pmax;
+			ac.me_init = false;
+
+			snprintf(buf, sizeof(buf), "Pmax = %u.%u uW \r\n", ac.pmax / 10, ac.pmax % 10);
+			Serial_Print(buf);
+			ac.state = AC_IDLE;
+		}
+		break;
+
+	default: break;
+	}
 }
 
 /* USER CODE END 0 */
@@ -613,17 +792,16 @@ int main(void)
   HAL_GPIO_WritePin(EN_Port, EN_Pin, GPIO_PIN_RESET);
   Serial_Println("--- Dual Axis Limit Controller (Y & Z) ---");
   Restart_States();
+  ac.steps = 10;
+  ac.dirz = 0;
+  ac.diry = 0;
+  ac.pavg_num = 5;
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	output_pow_tm = 300;
-	// 1. Check physical switch states (Assumes limits have Pull-Ups configured in CubeMX)
-	isXPressed = (HAL_GPIO_ReadPin(LIMIT_X_Port, LIMIT_X_Pin) == GPIO_PIN_RESET);
-	isYPressed = (HAL_GPIO_ReadPin(LIMIT_Y_Port, LIMIT_Y_Pin) == GPIO_PIN_RESET);
-	isZPressed = (HAL_GPIO_ReadPin(LIMIT_Z_Port, LIMIT_Z_Pin) == GPIO_PIN_RESET);
 
 	if(!pause){
 		Handle_Movement();
@@ -633,9 +811,10 @@ int main(void)
 
 	Serial_Comms();
 
-	if(HAL_GetTick() - timestamp > output_pow_tm || (opt.optimize_state_machine != opt_idle && !stepsRemainingX && !stepsRemainingY && !stepsRemainingZ)){
+	if(HAL_GetTick() - timestamp > output_pow_tm){
 		I2C_Readout();
-		Optimize();
+		if(opt.optimize_state_machine != OPT_IDLE && !stepsRemainingX && !stepsRemainingY && !stepsRemainingZ) Optimize();
+		if(ac.state != AC_OFF) Active_Compensation();
 	}
 
 
