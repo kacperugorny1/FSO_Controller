@@ -62,7 +62,7 @@
 #define SFP_ADDR_INFO  (0x50 << 1) // 0xA0
 #define SFP_ADDR_DDM   (0x51 << 1) // 0xA2
 
-#define BLACK 1
+#define BLACK 0
 #if BLACK == 1 //BLACK
 #define A_T_D 5748
 #define D_T_A (3164 - 300)
@@ -93,8 +93,9 @@
 // =========================================================
 
 // Timing & Iterations
-#define AC_TIMEOUT_MS          1000   // Comm timeout and IDLE reset interval (ms)
-#define AC_RUN_ITERATIONS      10     // Number of step iterations per compensation run
+#define AC_TIMEOUT_MS          2000   // Comm timeout and IDLE reset interval (ms)
+#define AC_RUN_ITERATIONS      30     // Number of step iterations per compensation run
+#define AC_RUN_HISTORY	       1     // Number of step iterations per compensation run
 #define AC_TICKS_PER_STEP      3      // Super loop cycles to wait between motor evaluations
 
 // Math & Thresholds
@@ -151,6 +152,8 @@ struct ac_struct{
 	bool dir;
 	bool dirz, diry;
 	bool me_init;
+	uint32_t mov_avg_arr[AC_RUN_HISTORY];
+	uint8_t dir_change_count[2];
 } ac;
 
 struct spiral_struct{
@@ -214,6 +217,7 @@ bool histeresis_hit = false;
 bool first_sweep = false;
 bool second_sweep = false;
 
+bool skip_end_sw = false;
 bool axis_homed = false;
 // Latch variables
 int blockedDirX = -1;
@@ -258,7 +262,7 @@ void Restart_States(void){
 	spiral.increment = 0;
 
 	homing_state_machine = HO_IDLE;
-
+	skip_end_sw = false;
 
 	//MOVEMENT
 
@@ -280,17 +284,26 @@ void Restart_States(void){
 }
 
 void Handle_Movement(void){
-
+	//TODO: delay between off the switch and on again (anti bounce)
+	//static uint32_t timestamp_x = 0, timestamp_y = 0, timestamp_z = 0;
 
 	// 1. Check physical switch states (Assumes limits have Pull-Ups configured in CubeMX)
-	isXPressed = (HAL_GPIO_ReadPin(LIMIT_X_Port, LIMIT_X_Pin) == GPIO_PIN_RESET);
-	isYPressed = (HAL_GPIO_ReadPin(LIMIT_Y_Port, LIMIT_Y_Pin) == GPIO_PIN_RESET);
-	isZPressed = (HAL_GPIO_ReadPin(LIMIT_Z_Port, LIMIT_Z_Pin) == GPIO_PIN_RESET);
+	if(!skip_end_sw){
+		isXPressed = (HAL_GPIO_ReadPin(LIMIT_X_Port, LIMIT_X_Pin) == GPIO_PIN_RESET);
+		isYPressed = (HAL_GPIO_ReadPin(LIMIT_Y_Port, LIMIT_Y_Pin) == GPIO_PIN_RESET);
+		isZPressed = (HAL_GPIO_ReadPin(LIMIT_Z_Port, LIMIT_Z_Pin) == GPIO_PIN_RESET);
+	}
+	else{
+		isXPressed = false;
+		isYPressed = false;
+		isZPressed = false;
+
+	}
 	//Cool down the motors!
 	if(stepsRemainingX | stepsRemainingY | stepsRemainingZ)
 	  HAL_GPIO_WritePin(EN_Port, EN_Pin, GPIO_PIN_RESET);
 	else
-		HAL_GPIO_WritePin(EN_Port, EN_Pin, GPIO_PIN_SET);
+	  HAL_GPIO_WritePin(EN_Port, EN_Pin, GPIO_PIN_SET);
 
 	// 2. Handle X Latching Logic
 	if (isXPressed) {
@@ -429,30 +442,30 @@ void Homing_State_Machine(void){
 	if(!(homing_state_machine != HO_IDLE && !stepsRemainingX && !stepsRemainingY && !stepsRemainingZ)) return;
 	switch(homing_state_machine){
 	case TO_E:
-		HAL_GPIO_WritePin(DIRX_Port, DIRX_Pin, GPIO_PIN_SET); xMoving = true; stepsRemainingX = 60000;
+		HAL_GPIO_WritePin(DIRX_Port, DIRX_Pin, GPIO_PIN_SET); xMoving = true; stepsRemainingX = 60000; skip_end_sw = false;
 		break;
 
 	case HOME_X:
-		if(!axis_homed) { HAL_GPIO_WritePin(DIRX_Port, DIRX_Pin, GPIO_PIN_RESET); xMoving = true; stepsRemainingX = E_T_R; axis_homed = true; }
-		else homing_state_machine = HO_IDLE;
+		if(!axis_homed) { HAL_GPIO_WritePin(DIRX_Port, DIRX_Pin, GPIO_PIN_RESET); xMoving = true; stepsRemainingX = E_T_R; axis_homed = true; skip_end_sw = true; }
+		else { Restart_States(); homing_state_machine = HO_IDLE; }
 		break;
 
 	case TO_D:
-		HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, GPIO_PIN_SET); yMoving = true; stepsRemainingY = 15000;
+		HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, GPIO_PIN_SET); yMoving = true; stepsRemainingY = 15000; skip_end_sw = false;
 		break;
 
 	case HOME_Y:
-		if(!axis_homed) { HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, GPIO_PIN_RESET); yMoving = true; stepsRemainingY = D_T_A; axis_homed = true; }
+		if(!axis_homed) { HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, GPIO_PIN_RESET); yMoving = true; stepsRemainingY = D_T_A; axis_homed = true; skip_end_sw = true;}
 		else homing_state_machine = TO_W;
 		break;
 
 	case TO_W:
-		HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, GPIO_PIN_RESET); zMoving = true; stepsRemainingZ = 15000;
+		HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, GPIO_PIN_RESET); zMoving = true; stepsRemainingZ = 15000; skip_end_sw = false;
 		break;
 
 	case HOME_Z:
-		if(!axis_homed) { HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, GPIO_PIN_SET); zMoving = true; stepsRemainingZ = W_T_X; axis_homed = true; }
-		else homing_state_machine = HO_IDLE;
+		if(!axis_homed) { HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, GPIO_PIN_SET); zMoving = true; stepsRemainingZ = W_T_X; axis_homed = true; skip_end_sw = true; }
+		else { Restart_States(); homing_state_machine = HO_IDLE; }
 		break;
 	default: break;
 
@@ -477,22 +490,24 @@ void Serial_Comms(void){
 
 		case 'c':
 		  if(ac.state == AC_OFF){
+			  Serial_Println("Active compensation ON!");
 			  Restart_States();
 			  ac.state = AC_PAVG_MEAS;
 			  ac.SMA_num = ac.pavg_num;
 			  output_pow_tm = ADC_REFRESH_TIME;
-			  Serial_Println("Active compensation ON!");
 		  }
 		  else {
+			  Serial_Println("Active compensation OFF!");
 			  Restart_States();
 			  ac.state = AC_OFF;
-			  Serial_Println("Active compensation OFF!");
 		  }
 		  break;
 		case '\'':
 			if(ac.state == AC_IDLE) {
-			  Serial_Println("Receive AC_INIT");
+			  Serial_Println("Receive AC_INIT, START RUN");
 			  ac.me_init = false;
+			  ac.dir_change_count[0] = 0; ac.dir_change_count[1] = 0;
+			  memset(ac.mov_avg_arr, 0, sizeof(ac.mov_avg_arr));
 			  ac.state = AC_RUN;
 			  ac.iter = AC_RUN_ITERATIONS;
 			  ac.EMA_num = 0;
@@ -501,16 +516,18 @@ void Serial_Comms(void){
 		  break;
 		case '"':
 		  if(ac.state == AC_IDLE){
+			  Serial_Println("Receive AC_DONE, START RUN");
+			  ac.dir_change_count[0] = 0; ac.dir_change_count[1] = 0;
+			  memset(ac.mov_avg_arr, 0, sizeof(ac.mov_avg_arr));
 			  ac.state = AC_RUN;
 			  ac.iter = AC_RUN_ITERATIONS;
 			  ac.EMA_num = 0;
-			  Serial_Println("Receive AC_DONE, START RUN");
 		  }
 		  else if(ac.state == AC_WAIT_TO_SAVE){
+			  Serial_Println("Receive AC_DONE, PROCESS AVG");
 			  ac.state = AC_PAVG_MEAS;
 			  ac.SMA_num = ac.pavg_num;
 			  ac.mov_avg = 0;
-			  Serial_Println("Receive AC_DONE, PROCESS AVG");
 		  }
 		  break;
 
@@ -652,7 +669,7 @@ void Optimize(void){
 	if((rx_raw < rx_raw_max / 4 || rx_raw == 0) && histeresis_hit){
 		opt.dir = !opt.dir;
 		if(end_on_max && opt.step_size != 1) {if((opt.step_size -= 2) < 1) opt.step_size = 1;}
-		else if(end_on_max) rx_raw_max -= 10;
+		else if(end_on_max) rx_raw_max -= 25;
 		end_on_max = second_sweep;
 		second_sweep = first_sweep;
 		first_sweep = true;
@@ -673,7 +690,7 @@ void Active_Compensation(void){
 	char buf[32];
 	if(ac.state == AC_OFF) return;
 	static uint32_t ac_timestamp;
-	static uint32_t old_mov_avg;
+	static uint16_t start_level, max_level;
 
 	// whole procedure must be pretty quick, to make it work real time
 	switch(ac.state){
@@ -685,7 +702,15 @@ void Active_Compensation(void){
 		ac.mov_avg = rx_raw / AC_EMA_PERIOD + ac.mov_avg * (AC_EMA_PERIOD - 1) / AC_EMA_PERIOD;
 		if(HAL_GetTick() - ac_timestamp > AC_TIMEOUT_MS && ac.mov_avg <= ac.pmax * AC_THRESH_NUM / AC_THRESH_DEN){
 			Serial_Println("AC_INIT");
-			snprintf(buf, sizeof(buf), "Pavg = %u.%u uW \r\n", ac.mov_avg / 10, ac.mov_avg % 10);
+			snprintf(buf, sizeof(buf), "Power dropped, Pavg = %u.%u uW \r\n", ac.mov_avg / 10, ac.mov_avg % 10);
+			Serial_Print(buf);
+
+			ac_timestamp = HAL_GetTick();
+			ac.me_init = true;
+		}
+		else if(HAL_GetTick() - ac_timestamp > AC_TIMEOUT_MS && ac.mov_avg >= ac.pmax * (AC_THRESH_DEN * 2 - AC_THRESH_NUM) / AC_THRESH_DEN){
+			Serial_Println("AC_INIT");
+			snprintf(buf, sizeof(buf), "Power fix, Pavg = %u.%u uW \r\n", ac.mov_avg / 10, ac.mov_avg % 10);
 			Serial_Print(buf);
 
 			ac_timestamp = HAL_GetTick();
@@ -695,27 +720,60 @@ void Active_Compensation(void){
 		break;
 	case AC_RUN:
 		//Receive signal from Serialcomms, AC_INIT/AC_DONE FROM AC_IDLE
-		if(ac.EMA_num == 0){
-			if(ac.dir){
-				if(old_mov_avg > ac.mov_avg) ac.dirz = !ac.dirz;
-				HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, ac.dirz); zMoving = true; stepsRemainingZ = ac.steps;
-			}
-			else{
-				--ac.iter;
-				if(old_mov_avg > ac.mov_avg) ac.diry = !ac.diry;
-				HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, ac.diry); yMoving = true; stepsRemainingY = ac.steps;
-			}
-			ac.dir = !ac.dir;
-			old_mov_avg = ac.mov_avg;
+		//Check if start measure this axis
+		ac.mov_avg = (ac.mov_avg + rx_raw) / 2;
+		if(ac.mov_avg_arr[0] == 0) {
+			start_level = ac.mov_avg;
+			max_level = ac.mov_avg;
 		}
-		ac.mov_avg = ac.mov_avg / 2 + rx_raw / 2;
+		if(ac.mov_avg > max_level) max_level = ac.mov_avg;
+
+		if(ac.EMA_num == 0){
+			if(ac.dir_change_count[ac.dir] == 2 && ac.mov_avg >= max_level * AC_THRESH_NUM / AC_THRESH_DEN){
+				++ac.dir_change_count[ac.dir]; // FINISH
+				Serial_Println("Axis found");
+			}
+			else if(ac.dir){
+				if(ac.mov_avg < start_level / 2) {
+					ac.dirz = !ac.dirz;
+					++ac.dir_change_count[ac.dir];
+					stepsRemainingZ = (5) * ac.steps;
+					Serial_Println("Change dirz");
+				}
+				else stepsRemainingZ = ac.steps;
+				HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, ac.dirz); zMoving = true;
+			}
+			else if (!ac.dir){
+				if(ac.mov_avg < start_level / 2) {
+					ac.diry = !ac.diry;
+					++ac.dir_change_count[ac.dir];
+					stepsRemainingY = (5) * ac.steps;
+					Serial_Println("Change diry");
+				}
+				else stepsRemainingY = ac.steps;
+				HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, ac.diry); zMoving = true;
+			}
+			--ac.iter;
+			//Change Z/Y if done
+			if(ac.dir_change_count[ac.dir] == 3) {
+				ac.dir = !ac.dir;
+				memset(ac.mov_avg_arr, 0, sizeof(ac.mov_avg_arr));
+			}
+			//If both done signal finish
+			if(ac.dir_change_count[0] == 3 && ac.dir_change_count[1] == 3) ac.iter = 0;
+			//Save current result
+			for(int i = AC_RUN_HISTORY - 1; i > 0; --i){
+				ac.mov_avg_arr[i] = ac.mov_avg_arr[i - 1];
+			}
+			ac.mov_avg_arr[0] = ac.mov_avg;
+		}
 		ac.EMA_num = (ac.EMA_num + 1) % AC_TICKS_PER_STEP;
+		//Finish
 		if(!ac.iter){
 			ac.state = AC_WAIT_TO_SAVE;
 			ac_timestamp = HAL_GetTick();
 			Serial_Println("AC_DONE");
 		}
-
 		break;
 
 	case AC_WAIT_TO_SAVE:
@@ -795,7 +853,7 @@ int main(void)
   ac.steps = 10;
   ac.dirz = 0;
   ac.diry = 0;
-  ac.pavg_num = 5;
+  ac.pavg_num = 13;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -825,6 +883,56 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
   }
+
+  /*
+   	case AC_RUN:
+		//Receive signal from Serialcomms, AC_INIT/AC_DONE FROM AC_IDLE
+		ac.mov_avg = (ac.mov_avg + rx_raw) / 2;
+		if(ac.EMA_num == 0){
+			if(ac.dir){
+				//Check for down pattern or flat pattern
+				for(int i = AC_RUN_HISTORY - 1; i > 0; --i)
+					if(ac.mov_avg_arr[i] < ac.mov_avg_arr[i - 1]) cond_swap_dir = false;
+				if(ac.mov_avg_arr[0] < ac.mov_avg) cond_swap_dir = false;
+				if(cond_swap_dir) { ac.dirz = !ac.dirz; ++ac.dir_change_count[ac.dir];}
+				HAL_GPIO_WritePin(DIRZ_Port, DIRZ_Pin, ac.dirz); zMoving = true;
+				if(cond_swap_dir) stepsRemainingZ = (AC_RUN_HISTORY + 1) * ac.steps;
+				else stepsRemainingZ = ac.steps;
+			}
+			else if (!ac.dir){
+				//Check for down pattern or flat pattern
+				for(int i = AC_RUN_HISTORY - 1; i > 0; --i)
+					if(ac.mov_avg_arr[i] < ac.mov_avg_arr[i - 1]) cond_swap_dir = false;
+				if(ac.mov_avg_arr[0] < ac.mov_avg) cond_swap_dir = false;
+				if(cond_swap_dir) {ac.diry = !ac.diry; ++ac.dir_change_count[ac.dir];}
+				HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, ac.diry); yMoving = true;
+				if(cond_swap_dir) stepsRemainingY = (AC_RUN_HISTORY + 1) * ac.steps;
+				else stepsRemainingY = ac.steps;
+			}
+			--ac.iter;
+			//Change Z/Y if done
+			if(ac.dir_change_count[ac.dir] == 2) {
+				ac.dir = !ac.dir;
+				memset(ac.mov_avg_arr, 0, sizeof(ac.mov_avg_arr));
+			}
+			//If both done signal finish
+			if(ac.dir_change_count[0] == 2 && ac.dir_change_count[1] == 2) ac.iter = 0;
+			//Save current result
+			for(int i = AC_RUN_HISTORY - 1; i > 0; --i){
+				ac.mov_avg_arr[i] = ac.mov_avg_arr[i - 1];
+			}
+			ac.mov_avg_arr[0] = ac.mov_avg;
+		}
+		ac.EMA_num = (ac.EMA_num + 1) % AC_TICKS_PER_STEP;
+		//Finish
+		if(!ac.iter){
+			ac.state = AC_WAIT_TO_SAVE;
+			ac_timestamp = HAL_GetTick();
+			Serial_Println("AC_DONE");
+		}
+		break;
+
+   */
   /* USER CODE END 3 */
 }
 
