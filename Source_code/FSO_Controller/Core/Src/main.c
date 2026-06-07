@@ -62,7 +62,7 @@
 #define SFP_ADDR_INFO  (0x50 << 1) // 0xA0
 #define SFP_ADDR_DDM   (0x51 << 1) // 0xA2
 
-#define BLACK 0
+#define BLACK 1
 #if BLACK == 1 //BLACK
 #define A_T_D 5748
 #define D_T_A (3164 - 300)
@@ -223,6 +223,10 @@ bool axis_homed = false;
 int blockedDirX = -1;
 int blockedDirY = -1;
 int blockedDirZ = -1;
+
+bool ddm_benchmark = false;
+uint16_t ddm_benchmark_i = 0;
+uint32_t ddm_benchmark_timestamp = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -236,6 +240,12 @@ static void MX_I2C1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void delay_half_ms(void) {
+    // 8,000 iterations * ~4 cycles/iteration = ~32,000 cycles (0.5ms at 64MHz)
+    for (volatile uint32_t i = 0; i < 4000; i++) {
+        __asm("NOP"); // No Operation: wastes 1 cycle to keep timing predictable
+    }
+}
 void Serial_Print(const char* str) {
     HAL_UART_Transmit(&huart2, (uint8_t*)str, strlen(str), HAL_MAX_DELAY);
 }
@@ -284,9 +294,6 @@ void Restart_States(void){
 }
 
 void Handle_Movement(void){
-	//TODO: delay between off the switch and on again (anti bounce)
-	//static uint32_t timestamp_x = 0, timestamp_y = 0, timestamp_z = 0;
-
 	// 1. Check physical switch states (Assumes limits have Pull-Ups configured in CubeMX)
 	if(!skip_end_sw){
 		isXPressed = (HAL_GPIO_ReadPin(LIMIT_X_Port, LIMIT_X_Pin) == GPIO_PIN_RESET);
@@ -380,8 +387,8 @@ void Handle_Movement(void){
 	  else { HAL_GPIO_WritePin(STEPZ_Port, STEPZ_Pin, GPIO_PIN_SET);  ++steps_bef_resetZ; }
 	}
 
-	// Delay 1ms (equivalent to delayMicroseconds(1000))
-	HAL_Delay(2);
+//	HAL_Delay(1);
+	delay_half_ms();
 
 	HAL_GPIO_WritePin(STEPX_Port, STEPX_Pin, GPIO_PIN_RESET);
 	HAL_GPIO_WritePin(STEPY_Port, STEPY_Pin, GPIO_PIN_RESET);
@@ -487,6 +494,15 @@ void Serial_Comms(void){
 		  opt.step_size = 10;
 		  output_pow_tm = ADC_REFRESH_TIME;
 		  break;
+
+		case 'b':
+			output_pow_tm = 2;
+			ddm_benchmark_i = 0;
+			ddm_benchmark = true;
+			ddm_benchmark_timestamp = HAL_GetTick();
+			HAL_GPIO_WritePin(DIRY_Port, DIRY_Pin, GPIO_PIN_SET); yMoving = true; stepsRemainingY = 200;
+
+			break;
 
 		case 'c':
 		  if(ac.state == AC_OFF){
@@ -610,6 +626,8 @@ void Serial_Comms(void){
 
 void I2C_Readout(void){
 	//READOUT
+	static uint16_t ddm_benchmark_time[256];
+	static uint16_t ddm_benchmark_power[256];
 
 	if (HAL_I2C_Mem_Read(&hi2c1, SFP_ADDR_DDM, 96, I2C_MEMADD_SIZE_8BIT, &ddm_data[96], 22,100) != HAL_OK) return;
 	char buf[32];
@@ -625,9 +643,27 @@ void I2C_Readout(void){
 
 	timestamp = HAL_GetTick();
 	// Outputs: "Power: 123.4 uW"
-	if(ac.state == AC_OFF){
+	if(ac.state == AC_OFF && !ddm_benchmark){
 		snprintf(buf, sizeof(buf), "T:%lu, Power: %u.%u uW\r\n",timestamp , whole_uw, decimal_uw);
 		Serial_Print(buf);
+	}
+	else if(ddm_benchmark){
+		ddm_benchmark_time[ddm_benchmark_i] = timestamp - ddm_benchmark_timestamp;
+		ddm_benchmark_power[ddm_benchmark_i++] = rx_raw;
+		ddm_benchmark_i = ddm_benchmark_i % 256;
+		if(!stepsRemainingY){
+			//PRINT IN LOOP
+			snprintf(buf, sizeof(buf), "Benchmark ok, i: %u", ddm_benchmark_i);
+			Serial_Println(buf);
+			for(int i = 0; i < ddm_benchmark_i; ++i){
+				snprintf(buf, sizeof(buf), "%u:%u;\r\n", ddm_benchmark_time[i], ddm_benchmark_power[i]);
+				Serial_Print(buf);
+			}
+
+			ddm_benchmark = false;
+			ddm_benchmark_i = 0;
+			output_pow_tm = 0xFFFF;
+		}
 	}
 
 //			float rx_uw = rx_raw * 0.0001f;
@@ -990,7 +1026,7 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.ClockSpeed = 400000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
