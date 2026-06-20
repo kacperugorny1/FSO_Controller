@@ -9,11 +9,11 @@
 #include "esp_now.h"
 #include "esp_mac.h"
 #include "driver/uart.h"
+#include "driver/usb_serial_jtag.h" // Native USB Driver
 
 // -----------------------------------------------------------------------------
 // CONFIGURATION
 // -----------------------------------------------------------------------------
-#define UART_PC            UART_NUM_0 // Connection to your PC (via USB)
 #define UART_DEVICE        UART_NUM_1 // Connection to the local wired device
 #define UART_BAUD_RATE     115200
 #define UART_BUF_SIZE      1024
@@ -25,8 +25,7 @@
 
 static const char *TAG = "MASTER_HUB";
 
-// Queues for all three data streams
-static QueueHandle_t uart_pc_queue;
+// Queues for data streams
 static QueueHandle_t uart_device_queue;
 static QueueHandle_t espnow_rx_queue;
 
@@ -54,35 +53,29 @@ static void master_espnow_recv_cb(const esp_now_recv_info_t *recv_info, const ui
 // RTOS TASKS
 // -----------------------------------------------------------------------------
 
-// TASK 1: PC -> Master -> (Routes to Slave OR Local Device)
-static void pc_uart_router_task(void *pvParameters) {
-    uart_event_t event;
+// TASK 1: PC (via USB) -> Master -> (Routes to Slave OR Local Device)
+static void pc_usb_router_task(void *pvParameters) {
     uint8_t *dtmp = (uint8_t *)malloc(UART_BUF_SIZE);
 
-    ESP_LOGI(TAG, "PC Router Task Started. Listening for 'S:' prefix...");
+    ESP_LOGI(TAG, "PC USB Router Task Started. Listening for 'S:' prefix...");
 
     while (1) {
-        if (xQueueReceive(uart_pc_queue, (void *)&event, ESPNOW_MAX_DELAY)) {
-            if (event.type == UART_DATA) {
-                int len = uart_read_bytes(UART_PC, dtmp, event.size, ESPNOW_MAX_DELAY);
-                
-                // If it has the "S:" prefix, route it to the Remote Slave via ESP-NOW
-                if (len >= 2 && strncmp((char *)dtmp, "S:", 2) == 0) {
-                    int payload_len = len - 2;
-                    if (payload_len > ESP_NOW_MAX_DATA_LEN) {
-                        payload_len = ESP_NOW_MAX_DATA_LEN; // Prevent overflow
-                    }
-                    esp_err_t err = esp_now_send(slave_mac, dtmp + 2, payload_len);
-                    if (err != ESP_OK) ESP_LOGW(TAG, "Slave Send Error: %s", esp_err_to_name(err));
-                } 
-                // Otherwise, route it directly to the Local Wired Device
-                else if (len > 0) {
-                    uart_write_bytes(UART_DEVICE, (const char *)dtmp, len);
+        // Block and wait for data from Native USB port (Wait up to 50ms per loop)
+        int len = usb_serial_jtag_read_bytes(dtmp, UART_BUF_SIZE, pdMS_TO_TICKS(50));
+        
+        if (len > 0) {
+            // If it has the "S:" prefix, route it to the Remote Slave via ESP-NOW
+            if (len >= 2 && strncmp((char *)dtmp, "S:", 2) == 0) {
+                int payload_len = len - 2;
+                if (payload_len > ESP_NOW_MAX_DATA_LEN) {
+                    payload_len = ESP_NOW_MAX_DATA_LEN; // Prevent overflow
                 }
-            }
-            else if (event.type == UART_FIFO_OVF || event.type == UART_BUFFER_FULL) {
-                uart_flush_input(UART_PC);
-                xQueueReset(uart_pc_queue);
+                esp_err_t err = esp_now_send(slave_mac, dtmp + 2, payload_len);
+                if (err != ESP_OK) ESP_LOGW(TAG, "Slave Send Error: %s", esp_err_to_name(err));
+            } 
+            // Otherwise, route it directly to the Local Wired Device (UART1)
+            else {
+                uart_write_bytes(UART_DEVICE, (const char *)dtmp, len);
             }
         }
     }
@@ -90,7 +83,7 @@ static void pc_uart_router_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
-// TASK 2: Local Wired Device -> Master -> PC
+// TASK 2: Local Wired Device (UART1) -> Master -> PC (via USB)
 static void device_uart_to_pc_task(void *pvParameters) {
     uart_event_t event;
     uint8_t *dtmp = (uint8_t *)malloc(UART_BUF_SIZE);
@@ -99,9 +92,9 @@ static void device_uart_to_pc_task(void *pvParameters) {
         if (xQueueReceive(uart_device_queue, (void *)&event, ESPNOW_MAX_DELAY)) {
             if (event.type == UART_DATA) {
                 int len = uart_read_bytes(UART_DEVICE, dtmp, event.size, ESPNOW_MAX_DELAY);
-                // Send directly to PC exactly as received (no prefix)
+                // Send directly to PC via USB exactly as received (no prefix)
                 if (len > 0) {
-                    uart_write_bytes(UART_PC, (const char *)dtmp, len);
+                    usb_serial_jtag_write_bytes((const char *)dtmp, len, portMAX_DELAY);
                 }
                 if (strncmp((char *)dtmp, "AC_INIT", 7) == 0) {
                     //Transfer to slave to initialize the AC unit
@@ -128,7 +121,7 @@ static void device_uart_to_pc_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
-// TASK 3: Remote Slave -> Master -> PC
+// TASK 3: Remote Slave -> Master -> PC (via USB)
 static void espnow_to_pc_task(void *pvParameters) {
     espnow_rx_packet_t packet;
     // Buffer to hold the "S:" prefix + the incoming payload
@@ -140,7 +133,10 @@ static void espnow_to_pc_task(void *pvParameters) {
         if (xQueueReceive(espnow_rx_queue, &packet, portMAX_DELAY)) {
             // Combine prefix and data so it prints seamlessly on the PC
             memcpy(&out_buf[2], packet.data, packet.len);
-            uart_write_bytes(UART_PC, (const char *)out_buf, packet.len + 2);
+            
+            // Write to PC via Native USB
+            usb_serial_jtag_write_bytes((const char *)out_buf, packet.len + 2, portMAX_DELAY);
+            
             if (strncmp((char *)packet.data, "AC_INIT", 7) == 0) {
                 // If the Slave sends an AC status update, also forward it to the Local Device
                 uart_write_bytes(UART_DEVICE, "\'", 1); // Send translated AC_INIT TO 1 byte message device understands
@@ -156,7 +152,15 @@ static void espnow_to_pc_task(void *pvParameters) {
 // INITIALIZATION ROUTINES
 // -----------------------------------------------------------------------------
 
-static void init_uarts(void) {
+static void init_interfaces(void) {
+    // 1. Initialize Native USB (Serial/JTAG) for PC
+    usb_serial_jtag_driver_config_t usb_config = {
+        .rx_buffer_size = UART_BUF_SIZE,
+        .tx_buffer_size = UART_BUF_SIZE,
+    };
+    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_config));
+
+    // 2. Initialize UART1 for the Local Wired Device
     uart_config_t uart_config = {
         .baud_rate = UART_BAUD_RATE,
         .data_bits = UART_DATA_8_BITS,
@@ -166,12 +170,6 @@ static void init_uarts(void) {
         .source_clk = UART_SCLK_DEFAULT,
     };
 
-    // Initialize UART0 (Connection to PC)
-    ESP_ERROR_CHECK(uart_driver_install(UART_PC, UART_BUF_SIZE * 2, UART_BUF_SIZE * 2, 20, &uart_pc_queue, 0));
-    ESP_ERROR_CHECK(uart_param_config(UART_PC, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(UART_PC, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-
-    // Initialize UART1 (Connection to Local Wired Device)
     ESP_ERROR_CHECK(uart_driver_install(UART_DEVICE, UART_BUF_SIZE * 2, UART_BUF_SIZE * 2, 20, &uart_device_queue, 0));
     ESP_ERROR_CHECK(uart_param_config(UART_DEVICE, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(UART_DEVICE, UART_DEVICE_TX_PIN, UART_DEVICE_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
@@ -187,13 +185,9 @@ static void init_wifi_full_range(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // 1. Enable Long Range (LR) Protocol alongside standard modes
+    // Enable Long Range (LR) Protocol alongside standard modes
     ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
-    
-    // 2. Stay on the quiet channel
     ESP_ERROR_CHECK(esp_wifi_set_channel(13, WIFI_SECOND_CHAN_NONE));
-    
-    // 3. Force Maximum Hardware TX Power (20 dBm)
     ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(80));
 }
 
@@ -234,14 +228,14 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    init_uarts();
+    init_interfaces();
     init_wifi_full_range();
     init_espnow();
 
     espnow_rx_queue = xQueueCreate(10, sizeof(espnow_rx_packet_t));
     
     // Start all three routing tasks
-    xTaskCreate(pc_uart_router_task, "pc_router", 4096, NULL, 5, NULL);
+    xTaskCreate(pc_usb_router_task, "pc_router", 4096, NULL, 5, NULL);
     xTaskCreate(device_uart_to_pc_task, "dev_to_pc", 4096, NULL, 5, NULL);
     xTaskCreate(espnow_to_pc_task, "esp_to_pc", 4096, NULL, 5, NULL);
     

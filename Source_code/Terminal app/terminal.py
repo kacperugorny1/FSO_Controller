@@ -1,48 +1,56 @@
 import tkinter as tk
 from tkinter import scrolledtext, messagebox, filedialog
 import serial
-import serial.tools.list_ports
 import threading
 import queue
 import sys
+import time
 from datetime import datetime
 
+# --- CONFIGURATION ---
+DEBUG_MODE = True  # <--- Prints raw background data to the console
+
 # --- THEME COLORS ---
-BG_COLOR = "#0A0A0A"      # Deep black/dark gray background
-FG_COLOR = "#E0E0E0"      # Light gray text for readability
-CURSOR_COLOR = "#00FF00"  # Bright green blinking block cursor
+BG_COLOR = "#0A0A0A"
+FG_COLOR = "#E0E0E0"
+CURSOR_COLOR = "#00FF00"
 
 class DualSerialMonitor:
-    def __init__(self, root, baudrate=115200):
+    def __init__(self, root, target_port='COM10', baudrate=115200):
         self.root = root
+        self.target_port = target_port
         self.baudrate = baudrate
         self.serial_port = None
         self.running = True
         self.data_queue = queue.Queue()
         self.read_thread = None
-
-        self.known_ports = set(p.device for p in serial.tools.list_ports.comports())
         
-        # --- Main Window (Normal Terminal) ---
+        # --- Main Window (Master Terminal) ---
         self.root.geometry("600x400+100+100") 
         self.root.configure(bg=BG_COLOR)
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-        # --- Secondary Window (S: Prefixed Terminal) ---
+        # --- Secondary Window (Slave Terminal) ---
         self.special_window = tk.Toplevel(self.root)
         self.special_window.geometry("600x400+750+100") 
         self.special_window.configure(bg=BG_COLOR)
         self.special_window.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         self.build_gui()
-        self.update_titles("Waiting for new device connection...")
+        self.update_titles(f"Looking for {self.target_port}...")
+
+        self.log_debug("Application started. Waiting for connection loop...")
 
         # Start GUI background loops
         self.root.after(100, self.process_queue)
-        self.root.after(1000, self.scan_for_device)
+        self.root.after(1000, self.connection_loop)
+
+    def log_debug(self, msg):
+        if DEBUG_MODE:
+            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            print(f"[{timestamp}] {msg}")
 
     def build_gui(self):
-        # Normal Text Widget (Master)
         self.normal_text = scrolledtext.ScrolledText(
             self.root, wrap=tk.WORD, bg=BG_COLOR, fg=FG_COLOR,
             blockcursor=True, insertbackground=CURSOR_COLOR, insertwidth=8,
@@ -52,7 +60,6 @@ class DualSerialMonitor:
         self.normal_text.bind("<KeyPress>", self.send_normal_char)
         self.normal_text.focus_set()
 
-        # Special Text Widget (Slave)
         self.special_text = scrolledtext.ScrolledText(
             self.special_window, wrap=tk.WORD, bg=BG_COLOR, fg=FG_COLOR,
             blockcursor=True, insertbackground=CURSOR_COLOR, insertwidth=8,
@@ -69,51 +76,78 @@ class DualSerialMonitor:
         self.data_queue.put(message)
         self.data_queue.put(f"S:{message}")
 
-    def scan_for_device(self):
+    def reset_connection(self):
+        """Forces Windows to flush ghost buffers and reset the USB driver state."""
+        try:
+            self.log_debug("Attempting DTR/RTS hardware reset...")
+            self.serial_port.dtr = False
+            self.serial_port.rts = False
+            time.sleep(0.1)
+            self.serial_port.dtr = True
+            self.serial_port.rts = True
+            time.sleep(0.1)
+            self.serial_port.reset_input_buffer()
+            self.serial_port.reset_output_buffer()
+            self.log_debug("Hardware reset successful.")
+        except Exception as e:
+            self.log_debug(f"Hardware reset failed (this is usually okay): {e}")
+
+    def connection_loop(self):
         if not self.running: 
             return
 
-        current_ports = set(p.device for p in serial.tools.list_ports.comports())
-
         if self.serial_port is None or not self.serial_port.is_open:
-            new_ports = current_ports - self.known_ports
-
-            if new_ports:
-                target_port = list(new_ports)[0]
-                try:
-                    self.serial_port = serial.Serial(target_port, self.baudrate, timeout=0.1)
-                    self.update_titles(f"Connected to {target_port} @ {self.baudrate}")
-                    self.inject_system_message(f"--- CONNECTED TO {target_port} ---")
-                    
-                    self.read_thread = threading.Thread(target=self.read_from_serial, daemon=True)
-                    self.read_thread.start()
-                except serial.SerialException as e:
-                    print(f"Failed to connect to {target_port}: {e}")
+            try:
+                self.serial_port = serial.Serial(self.target_port, self.baudrate, timeout=0.05)
+                
+                # Immediately try to bust any ghost ports created by Windows
+                self.reset_connection()
+                
+                self.log_debug(f"SUCCESS! Connected to {self.target_port}.")
+                self.update_titles(f"Connected to {self.target_port} @ {self.baudrate}")
+                self.inject_system_message(f"--- CONNECTED TO {self.target_port} ---")
+                
+                self.read_thread = threading.Thread(target=self.read_from_serial, daemon=True)
+                self.read_thread.start()
+            except serial.SerialException:
+                # Normal behavior when device is simply unplugged
+                self.update_titles(f"Waiting for {self.target_port} to be plugged in...")
             
-        self.known_ports = current_ports
-        self.root.after(1000, self.scan_for_device)
+        self.root.after(1000, self.connection_loop)
 
     def read_from_serial(self):
+        self.log_debug("Read thread started successfully.")
+        
         while self.running and self.serial_port and self.serial_port.is_open:
             try:
-                if self.serial_port.in_waiting:
-                    raw_data = self.serial_port.readline()
-                    try:
-                        decoded_text = raw_data.decode('utf-8').strip()
-                        if decoded_text:
-                            self.data_queue.put(decoded_text)
-                    except UnicodeDecodeError:
-                        pass
-            except serial.SerialException:
+                raw_data = self.serial_port.readline()
+                
+                if raw_data:
+                    self.log_debug(f"RAW RX BYTES: {raw_data}")
+                    
+                    decoded_text = raw_data.decode('utf-8', errors='replace').strip()
+                    
+                    if decoded_text:
+                        self.log_debug(f"DECODED TXT: {decoded_text}")
+                        self.data_queue.put(decoded_text)
+
+            except serial.SerialException as e:
+                self.log_debug(f"HARDWARE DISCONNECT (SerialException): {e}")
                 break 
-            except OSError:
+            except OSError as e:
+                self.log_debug(f"HARDWARE DISCONNECT (OSError): {e}")
                 break
 
+        self.log_debug("Read thread terminating. Cleaning up port...")
         if self.running and self.serial_port:
-            self.serial_port.close()
+            try:
+                self.serial_port.close()
+            except Exception:
+                pass
             self.serial_port = None
-            self.update_titles("Waiting for new device connection...")
-            self.inject_system_message("--- DEVICE DISCONNECTED ---")
+            
+            self.root.after(0, lambda: self.update_titles(f"Waiting for {self.target_port} to be plugged in..."))
+            self.inject_system_message("--- USB DEVICE DISCONNECTED ---")
 
     def process_queue(self):
         while not self.data_queue.empty():
@@ -124,7 +158,7 @@ class DualSerialMonitor:
                 self.append_text(self.normal_text, message)
 
         if self.running:
-            self.root.after(100, self.process_queue)
+            self.root.after(50, self.process_queue) 
 
     def append_text(self, text_widget, message):
         text_widget.insert(tk.END, message + "\n")
@@ -161,13 +195,12 @@ class DualSerialMonitor:
     def write_serial(self, message):
         if self.serial_port and self.serial_port.is_open:
             try:
+                self.log_debug(f"SENDING DATA: {message.encode('utf-8')}")
                 self.serial_port.write(message.encode('utf-8'))
-            except serial.SerialException:
-                pass 
+            except serial.SerialException as e:
+                self.log_debug(f"FAILED TO SEND DATA: {e}")
 
     def save_log(self, text_widget, default_filename):
-        """Opens a save dialog with a pre-filled filename and saves the widget's text."""
-        # Only prompt to save if there is actually text to save
         content = text_widget.get("1.0", tk.END).strip()
         if not content:
             return
@@ -182,32 +215,30 @@ class DualSerialMonitor:
             try:
                 with open(file_path, 'w', encoding='utf-8') as file:
                     file.write(content + "\n")
+                self.log_debug(f"Saved file successfully: {file_path}")
             except Exception as e:
                 messagebox.showerror("Save Error", f"Failed to save {default_filename}:\n{e}")
 
     def on_closing(self):
-        """Intercepts window close, prompts for saves, then kills the app."""
+        self.log_debug("User closed the window. Shutting down...")
         self.running = False
         
-        # Generate the timestamp
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        
-        # Prompt to save Master log
         self.save_log(self.normal_text, f"{timestamp}_master.log")
-        
-        # Prompt to save Slave log
         self.save_log(self.special_text, f"{timestamp}_slave.log")
 
-        # Clean up serial connection
         if self.serial_port and self.serial_port.is_open:
-            self.serial_port.close()
+            try:
+                self.serial_port.close()
+            except Exception:
+                pass
             
-        # Destroy the application
         self.root.destroy()
 
 if __name__ == "__main__":
+    TARGET_USB_PORT = 'COM10'
     BAUD_RATE = 115200
 
     root = tk.Tk()
-    app = DualSerialMonitor(root, baudrate=BAUD_RATE)
+    app = DualSerialMonitor(root, target_port=TARGET_USB_PORT, baudrate=BAUD_RATE)
     root.mainloop()
